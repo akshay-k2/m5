@@ -1,12 +1,13 @@
 import networkx as nx
 
+
 #----------------------------------------------------------------
 # Find valid DSP-delay configurations between two given nodes
 #----------------------------------------------------------------
 def find_valid_configs(TG, curr_node, curr_group_dsp, curr_group_delay, 
                        curr_node_idx, next_node, next_node_idx, 
-                       DSP_total, II, acc_config_enable):
-
+                       DSP_total, II, acc_config_enable, offset):
+    #breakpoint()
     valid_dsp_list   = []
     valid_delay_list = []
     
@@ -43,6 +44,9 @@ def find_valid_configs(TG, curr_node, curr_group_dsp, curr_group_delay,
                     total_delay = curr_group_delay[m] + next_node_delay[n]
                 else:
                     total_delay = max(curr_group_delay[m], next_node_delay[n])
+
+                # Added Sep 3
+                total_delay += offset
                 
                 if(total_util < DSP_total and total_delay < II):
                     valid_dsp_list.append(total_util)
@@ -67,6 +71,17 @@ def find_max_latency(L, latency_list, r, j, k):
 
 #----------------------------------------------------------------
 # DP Solver
+# 
+# Performs polynomial-time load-balancing of layers onto FPGAs
+# using dynamic programming.
+#
+# Only the computation cost of a layer is considered for mapping.
+# The purpose of this function to provide cost-balanced partitions
+# for evaluation.
+# 
+# First, all layers are mapped onto a single FPGA. Then,
+# the optimal cost-balanced mapping is for more number of FPGAs,
+# iteratively, upto N FPGAs (atleast one layer per FPGA)
 #----------------------------------------------------------------
 def dp_solver(G, topo_order, DSP_total, II):
     N = len(topo_order)
@@ -94,6 +109,7 @@ def dp_solver(G, topo_order, DSP_total, II):
 
     # Map onto multiple FPGAs incrementally
     for k in range(1, M):
+        #breakpoint() 
         for j in range(k, N):
             max_list = []
             
@@ -144,17 +160,34 @@ def cost_of_maps(DG, mappings, M):
 
     return costs
 
+def get_comm_cost(DG, critical_part):
+    offset = 0
+
+    for j in range(len(critical_part)):
+        curr_node_idx = critical_part[j]
+        curr_node     = DG.nodes[curr_node_idx]
+
+        for u, v, data in DG.in_edges(curr_node_idx, data=True):
+            delay = data['comm_delay']
+            if(delay > offset):
+                offset = delay
+
+    return offset
+
 #----------------------------------------------------------------
 # Use dynamic programming to obtain the minimal number of 
 # partitions of given DAG evaluated using the given
 # node ordering and the corresponding node mapping
 #----------------------------------------------------------------
-def find_optimal_partitions_dp(G, node_order, DSP_total, II, acc_config_enable):
+def find_optimal_partitions_dp(G, node_order, DSP_total, II, acc_config_enable, T):
     # Maximum number of partitions is same the number of nodes 
     # in the node ordering as each partition must contain 
     # at least one node
     max_num_of_partitions = len(node_order)
-   
+  
+    # Upper bound on cost that can fit on given board
+    cost_bound = (II * DSP_total * 10**6) / T
+
     # Use DP solver to find all mappings of given graph
     all_mappings = dp_solver(G, node_order, DSP_total, II)
     
@@ -166,10 +199,17 @@ def find_optimal_partitions_dp(G, node_order, DSP_total, II, acc_config_enable):
         critical_part      = all_mappings[M][critical_part_num+1]
         num_of_layers      = len(critical_part)
         
+        # If critical part cost exceed the max cost that can fit on board,
+        # no valid configuration exists. So skip.
+        if(critical_part_cost > cost_bound):
+            continue
+
         if(num_of_layers == 1):
             best_mapping = all_mappings[M]
             continue
 
+        delay_offset = get_comm_cost(G, critical_part)
+        
         curr_node_idx    = critical_part[0]
         curr_node        = G.nodes[curr_node_idx]
         curr_group_dsp   = list(curr_node['DSP-delay'].keys())
@@ -189,7 +229,8 @@ def find_optimal_partitions_dp(G, node_order, DSP_total, II, acc_config_enable):
                                                                   next_node_idx,
                                                                   DSP_total,
                                                                   II, 
-                                                                  acc_config_enable)
+                                                                  acc_config_enable,
+                                                                  delay_offset)
 
             if(len(valid_dsp_list) == 0): # Adding next node exceeds II or DSPs
                 break
@@ -240,7 +281,7 @@ def add_virtual_source_and_sink_nodes(G):
 #----------------------------------------------------------------
 # Critical path aware mapping (depth-wise)
 #----------------------------------------------------------------
-def critical_path_mapping(G, DSP_total, II, acc_config_enable):
+def critical_path_mapping(G, DSP_total, II, acc_config_enable, T):
     
     # Add a virtual source node and a virtual sink node
     DG = add_virtual_source_and_sink_nodes(G)
@@ -261,7 +302,7 @@ def critical_path_mapping(G, DSP_total, II, acc_config_enable):
 
     # Find best critical path mapping
     mappings = []
-    mapping  = find_optimal_partitions_dp(CG, critical_path, DSP_total, II, acc_config_enable)
+    mapping  = find_optimal_partitions_dp(CG, critical_path, DSP_total, II, acc_config_enable, T)
     mappings.append(mapping)
 
     #print("\nBest Critical Path Mapping:")
@@ -279,7 +320,7 @@ def critical_path_mapping(G, DSP_total, II, acc_config_enable):
         critical_path_delay = path_cost(SG, critical_path)
     
         # Find best mapping
-        mapping  = find_optimal_partitions_dp(SG, critical_path, DSP_total, II, acc_config_enable)
+        mapping  = find_optimal_partitions_dp(SG, critical_path, DSP_total, II, acc_config_enable, T)
         mappings.append(mapping)
 
         #print("\nNon-Critical Path Mapping:")
@@ -322,7 +363,7 @@ def check_order(DG, order):
 #----------------------------------------------------------------
 # List schedule based mapping (breadth-wise)
 #----------------------------------------------------------------
-def list_schedule_mapping(G, DSP_total, II, acc_config_enable, schedule_type):
+def list_schedule_mapping(G, DSP_total, II, acc_config_enable, schedule_type, T):
 
     # Add a virtual source node and a virtual sink node
     DG = add_virtual_source_and_sink_nodes(G)
@@ -413,7 +454,7 @@ def list_schedule_mapping(G, DSP_total, II, acc_config_enable, schedule_type):
 
     #print(level_order)
 
-    best_mapping = find_optimal_partitions_dp(DG, level_order, DSP_total, II, acc_config_enable) 
+    best_mapping = find_optimal_partitions_dp(DG, level_order, DSP_total, II, acc_config_enable, T) 
     
     return best_mapping
 
@@ -493,6 +534,6 @@ def cost_guided_mapping(DG, DSP_total, II, T, acc_config_enable):
 	
 	mapping = {}
 
-	mapping = find_optimal_partitions_dp(DG, topo_order, DSP_total, II, acc_config_enable)
+	mapping = find_optimal_partitions_dp(DG, topo_order, DSP_total, II, acc_config_enable, T)
 
 	return mapping 
